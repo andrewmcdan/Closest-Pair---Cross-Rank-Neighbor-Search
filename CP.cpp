@@ -22,8 +22,8 @@ struct Point {
 
 struct ClosestPairResult {
     double bestDistSq = std::numeric_limits<double>::infinity();
-    Point a{};
-    Point b{};
+    Point a {};
+    Point b {};
     std::uint64_t comparisons = 0;
 };
 
@@ -34,7 +34,8 @@ struct ClosestPairResult {
  * @param p2 Second point.
  * @return double Squared distance between p1 and p2.
  */
-double distance_squared_between(const Point& p1, const Point& p2) {
+double distance_squared_between(const Point& p1, const Point& p2)
+{
     const double dx = p1.x - p2.x;
     const double dy = p1.y - p2.y;
     return dx * dx + dy * dy;
@@ -46,15 +47,10 @@ double distance_squared_between(const Point& p1, const Point& p2) {
  * @param globalBestDistSq Shared best squared distance across workers.
  * @param candidateDistSq Candidate squared distance to publish.
  */
-void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateDistSq) {
+void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateDistSq)
+{
     double observed = globalBestDistSq.load(std::memory_order_relaxed);
-    while (candidateDistSq < observed &&
-           !globalBestDistSq.compare_exchange_weak(
-               observed,
-               candidateDistSq,
-               std::memory_order_relaxed,
-               std::memory_order_relaxed
-           )) {
+    while (candidateDistSq < observed && !globalBestDistSq.compare_exchange_weak(observed, candidateDistSq, std::memory_order_relaxed, std::memory_order_relaxed)) {
     }
 }
 
@@ -65,7 +61,8 @@ void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateD
  * @param q Second point.
  * @param result In/out aggregate result for best distance, best pair, and comparisons.
  */
-void consider_pair(const Point& p, const Point& q, ClosestPairResult& result) {
+void consider_pair(const Point& p, const Point& q, ClosestPairResult& result)
+{
     ++result.comparisons;
     const double dSq = distance_squared_between(p, q);
     if (dSq < result.bestDistSq) {
@@ -86,8 +83,8 @@ void consider_pair(const Point& p, const Point& q, ClosestPairResult& result) {
 std::vector<Point> generate_points(
     std::size_t count,
     unsigned int seed,
-    double distributionModifier
-) {
+    double distributionModifier)
+{
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> uniformDist(0.0, 100000.0);
 
@@ -97,15 +94,14 @@ std::vector<Point> generate_points(
     // 10.0 means near-uniform/even distribution.
     if (distributionModifier >= 10.0 - 1e-12) {
         for (std::size_t i = 0; i < count; ++i) {
-            points.push_back(Point{i, uniformDist(rng), uniformDist(rng)});
+            points.push_back(Point { i, uniformDist(rng), uniformDist(rng) });
         }
         return points;
     }
 
     // 0.0 means super-clumpy: very few cluster centers and tight spread.
     const double normalized = std::clamp(distributionModifier / 10.0, 0.0, 1.0);
-    const std::size_t clusterCount =
-        1 + static_cast<std::size_t>(std::llround(normalized * 49.0)); // [1, 50]
+    const std::size_t clusterCount = 1 + static_cast<std::size_t>(std::llround(normalized * 49.0)); // [1, 50]
 
     std::vector<std::pair<double, double>> centers;
     centers.reserve(clusterCount);
@@ -123,7 +119,7 @@ std::vector<Point> generate_points(
 
     for (std::size_t i = 0; i < count; ++i) {
         if (injectUniformNoise(rng)) {
-            points.push_back(Point{i, uniformDist(rng), uniformDist(rng)});
+            points.push_back(Point { i, uniformDist(rng), uniformDist(rng) });
             continue;
         }
 
@@ -131,7 +127,7 @@ std::vector<Point> generate_points(
         const double x = std::clamp(center.first + clusterOffset(rng), 0.0, 100000.0);
         const double y = std::clamp(center.second + clusterOffset(rng), 0.0, 100000.0);
 
-        points.push_back(Point{i, x, y});
+        points.push_back(Point { i, x, y });
     }
 
     return points;
@@ -143,7 +139,8 @@ std::vector<Point> generate_points(
  * @param points Input points.
  * @return ClosestPairResult Closest-pair result and comparison count.
  */
-ClosestPairResult brute_force_closest_pair(const std::vector<Point>& points) {
+ClosestPairResult brute_force_closest_pair(const std::vector<Point>& points)
+{
     ClosestPairResult result;
 
     if (points.size() < 2) {
@@ -168,8 +165,8 @@ ClosestPairResult brute_force_closest_pair(const std::vector<Point>& points) {
  */
 ClosestPairResult bootstrap_initial_bound(
     const std::vector<Point>& px,
-    const std::vector<Point>& py
-) {
+    const std::vector<Point>& py)
+{
     ClosestPairResult result;
 
     if (px.size() < 2) {
@@ -200,10 +197,9 @@ ClosestPairResult merge_divide_and_conquer_results(
     const ClosestPairResult& leftResult,
     const ClosestPairResult& rightResult,
     const std::vector<Point>& py,
-    double splitX
-) {
-    ClosestPairResult merged =
-        (leftResult.bestDistSq <= rightResult.bestDistSq) ? leftResult : rightResult;
+    double splitX)
+{
+    ClosestPairResult merged = (leftResult.bestDistSq <= rightResult.bestDistSq) ? leftResult : rightResult;
     merged.comparisons = leftResult.comparisons + rightResult.comparisons;
 
     std::vector<Point> strip;
@@ -242,8 +238,8 @@ ClosestPairResult merge_divide_and_conquer_results(
 ClosestPairResult brute_force_closest_pair_range(
     const std::vector<Point>& px,
     std::size_t beginIndex,
-    std::size_t endIndex
-) {
+    std::size_t endIndex)
+{
     ClosestPairResult result;
 
     if (endIndex <= beginIndex + 1) {
@@ -273,8 +269,8 @@ void split_py_with_rank_cut(
     const std::vector<std::size_t>& idToRank,
     std::size_t splitRank,
     std::vector<Point>& leftPy,
-    std::vector<Point>& rightPy
-) {
+    std::vector<Point>& rightPy)
+{
     leftPy.clear();
     rightPy.clear();
     leftPy.reserve(py.size() / 2 + 1);
@@ -304,8 +300,8 @@ ClosestPairResult divide_and_conquer_serial_rec(
     std::size_t beginIndex,
     std::size_t endIndex,
     const std::vector<Point>& py,
-    const std::vector<std::size_t>& idToRank
-) {
+    const std::vector<std::size_t>& idToRank)
+{
     if (endIndex - beginIndex <= 3) {
         return brute_force_closest_pair_range(px, beginIndex, endIndex);
     }
@@ -317,10 +313,8 @@ ClosestPairResult divide_and_conquer_serial_rec(
     std::vector<Point> rightPy;
     split_py_with_rank_cut(py, idToRank, mid, leftPy, rightPy);
 
-    const ClosestPairResult leftResult =
-        divide_and_conquer_serial_rec(px, beginIndex, mid, leftPy, idToRank);
-    const ClosestPairResult rightResult =
-        divide_and_conquer_serial_rec(px, mid, endIndex, rightPy, idToRank);
+    const ClosestPairResult leftResult = divide_and_conquer_serial_rec(px, beginIndex, mid, leftPy, idToRank);
+    const ClosestPairResult rightResult = divide_and_conquer_serial_rec(px, mid, endIndex, rightPy, idToRank);
 
     return merge_divide_and_conquer_results(leftResult, rightResult, py, splitX);
 }
@@ -344,8 +338,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
     const std::vector<Point>& py,
     const std::vector<std::size_t>& idToRank,
     std::size_t threadBudget,
-    std::size_t parallelThreshold
-) {
+    std::size_t parallelThreshold)
+{
     if (endIndex - beginIndex <= 3) {
         return brute_force_closest_pair_range(px, beginIndex, endIndex);
     }
@@ -375,10 +369,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
                     leftPy,
                     idToRank,
                     leftBudget,
-                    parallelThreshold
-                );
-            }
-        );
+                    parallelThreshold);
+            });
 
         rightResult = divide_and_conquer_parallel_rec(
             px,
@@ -387,8 +379,7 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             rightPy,
             idToRank,
             rightBudget,
-            parallelThreshold
-        );
+            parallelThreshold);
         leftResult = leftFuture.get();
     } else {
         leftResult = divide_and_conquer_parallel_rec(
@@ -398,8 +389,7 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             leftPy,
             idToRank,
             1,
-            parallelThreshold
-        );
+            parallelThreshold);
         rightResult = divide_and_conquer_parallel_rec(
             px,
             mid,
@@ -407,8 +397,7 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             rightPy,
             idToRank,
             1,
-            parallelThreshold
-        );
+            parallelThreshold);
     }
 
     return merge_divide_and_conquer_results(leftResult, rightResult, py, splitX);
@@ -420,7 +409,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
  * @param points Input points.
  * @return ClosestPairResult Closest-pair result computed by serial D&C.
  */
-ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point>& points) {
+ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point>& points)
+{
     ClosestPairResult result;
 
     if (points.size() < 2) {
@@ -431,14 +421,18 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
     std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
         return a.id < b.id;
     });
 
     std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y) return a.y < b.y;
-        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
         return a.id < b.id;
     });
 
@@ -459,8 +453,8 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
  */
 ClosestPairResult divide_and_conquer_parallel_closest_pair(
     const std::vector<Point>& points,
-    std::size_t threadCount
-) {
+    std::size_t threadCount)
+{
     ClosestPairResult result;
 
     if (points.size() < 2) {
@@ -475,14 +469,18 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
     std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
         return a.id < b.id;
     });
 
     std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y) return a.y < b.y;
-        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
         return a.id < b.id;
     });
 
@@ -499,8 +497,7 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
         py,
         idToRank,
         threadCount,
-        parallelThreshold
-    );
+        parallelThreshold);
 }
 
 /**
@@ -516,8 +513,8 @@ ClosestPairResult crns_serial_search_from_sorted_views(
     const std::vector<Point>& px,
     std::size_t beginIndex,
     std::size_t endIndex,
-    const std::vector<Point>& py
-) {
+    const std::vector<Point>& py)
+{
     ClosestPairResult result;
 
     if (endIndex <= beginIndex + 1) {
@@ -557,7 +554,7 @@ ClosestPairResult crns_serial_search_from_sorted_views(
 
 /**
  * @brief Hybrid recursive closest-pair solver using D&C outside and CRNS at leaf regions.
- * 
+ *
  * @param px X Sorted points
  * @param beginIndex Inclusive begin index in px for this subproblem
  * @param endIndex Exclusive end index in px for this subproblem
@@ -566,7 +563,7 @@ ClosestPairResult crns_serial_search_from_sorted_views(
  * @param threadBudget Number of threads that this call can use (including subcalls). If 1, runs serially.
  * @param parallelThreshold Minimum problem size (number of points in the current subproblem) to consider parallelizing. Below this, runs serially even if threadBudget > 1.
  * @param crnsLeafThreshold Minimum problem size to switch to CRNS leaf search. If the number of points in the current subproblem is <= this, runs CRNS instead of further dividing, even if threadBudget and parallelThreshold would allow further division.
- * @return ClosestPairResult 
+ * @return ClosestPairResult
  */
 ClosestPairResult hybrid_parallel_dnc_crns_rec(
     const std::vector<Point>& px,
@@ -576,8 +573,8 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
     const std::vector<std::size_t>& idToRank,
     std::size_t threadBudget,
     std::size_t parallelThreshold,
-    std::size_t crnsLeafThreshold
-) {
+    std::size_t crnsLeafThreshold)
+{
     const std::size_t problemSize = endIndex - beginIndex;
 
     if (problemSize <= 3) {
@@ -614,10 +611,8 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
                     idToRank,
                     leftBudget,
                     parallelThreshold,
-                    crnsLeafThreshold
-                );
-            }
-        );
+                    crnsLeafThreshold);
+            });
 
         rightResult = hybrid_parallel_dnc_crns_rec(
             px,
@@ -627,8 +622,7 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
             idToRank,
             rightBudget,
             parallelThreshold,
-            crnsLeafThreshold
-        );
+            crnsLeafThreshold);
         leftResult = leftFuture.get();
     } else {
         leftResult = hybrid_parallel_dnc_crns_rec(
@@ -639,8 +633,7 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
             idToRank,
             1,
             parallelThreshold,
-            crnsLeafThreshold
-        );
+            crnsLeafThreshold);
         rightResult = hybrid_parallel_dnc_crns_rec(
             px,
             mid,
@@ -649,8 +642,7 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
             idToRank,
             1,
             parallelThreshold,
-            crnsLeafThreshold
-        );
+            crnsLeafThreshold);
     }
 
     return merge_divide_and_conquer_results(leftResult, rightResult, py, splitX);
@@ -665,8 +657,8 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
  */
 ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
     const std::vector<Point>& points,
-    std::size_t threadCount
-) {
+    std::size_t threadCount)
+{
     ClosestPairResult result;
 
     if (points.size() < 2) {
@@ -681,14 +673,18 @@ ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
     std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
         return a.id < b.id;
     });
 
     std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y) return a.y < b.y;
-        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
         return a.id < b.id;
     });
 
@@ -707,17 +703,17 @@ ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
         idToRank,
         threadCount,
         parallelThreshold,
-        crnsLeafThreshold
-    );
+        crnsLeafThreshold);
 }
 
 /**
- * @brief Serial CRNS (Cross-Rank Neighborhood Search) closest-pair solver.
+ * @brief Serial CRNS (Cross-Rank Neighbor Search) closest-pair solver.
  *
  * @param points Input points.
  * @return ClosestPairResult Closest-pair result computed by serial CRNS.
  */
-ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points) {
+ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points)
+{
     ClosestPairResult finalResult;
 
     if (points.size() < 2) {
@@ -728,14 +724,18 @@ ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points) {
     std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
         return a.id < b.id;
     });
 
     std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y) return a.y < b.y;
-        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
         return a.id < b.id;
     });
 
@@ -780,8 +780,8 @@ void parallel_worker_x_forward(
     std::size_t endIndex,
     double initialBoundSq,
     std::atomic<double>& globalBestDistSq,
-    ClosestPairResult& outResult
-) {
+    ClosestPairResult& outResult)
+{
     ClosestPairResult local;
     local.bestDistSq = initialBoundSq;
 
@@ -840,8 +840,8 @@ void parallel_worker_x_forward(
  */
 ClosestPairResult chunked_parallel_cross_rank_search(
     const std::vector<Point>& points,
-    std::size_t threadCount
-) {
+    std::size_t threadCount)
+{
     ClosestPairResult finalResult;
 
     if (points.size() < 2) {
@@ -856,14 +856,18 @@ ClosestPairResult chunked_parallel_cross_rank_search(
     std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.y != b.y) return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
         return a.id < b.id;
     });
 
     std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y) return a.y < b.y;
-        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y)
+            return a.y < b.y;
+        if (a.x != b.x)
+            return a.x < b.x;
         return a.id < b.id;
     });
 
@@ -897,8 +901,7 @@ ClosestPairResult chunked_parallel_cross_rank_search(
             end,
             bootstrap.bestDistSq,
             std::ref(globalBestDistSq),
-            std::ref(localResults[t])
-        );
+            std::ref(localResults[t]));
 
         start = end;
     }
@@ -929,7 +932,8 @@ ClosestPairResult chunked_parallel_cross_rank_search(
  * @param label Section label to print above the result.
  * @param result Closest-pair result to display.
  */
-void print_result(const std::string& label, const ClosestPairResult& result) {
+void print_result(const std::string& label, const ClosestPairResult& result)
+{
     std::cout << label << "\n";
     std::cout << "  Best distance: " << std::setprecision(15) << std::sqrt(result.bestDistSq) << "\n";
     std::cout << "  Point A: id=" << result.a.id
@@ -948,7 +952,8 @@ void print_result(const std::string& label, const ClosestPairResult& result) {
  * @param programName Executable name from argv[0].
  * @param maxThreads Maximum allowed thread count (hardware_concurrency).
  */
-void print_usage(const char* programName, std::size_t maxThreads) {
+void print_usage(const char* programName, std::size_t maxThreads)
+{
     std::cout << "Usage: " << programName
               << " [--points N | --points=N | -p N]"
               << " [--threads T | --threads=T | -t T]"
@@ -973,7 +978,8 @@ void print_usage(const char* programName, std::size_t maxThreads) {
  * @param out Parsed value on success.
  * @return bool True if parsing succeeded and value is in range.
  */
-bool parse_positive_size_t(const std::string& value, std::size_t& out) {
+bool parse_positive_size_t(const std::string& value, std::size_t& out)
+{
     try {
         std::size_t parsedChars = 0;
         const unsigned long long parsed = std::stoull(value, &parsedChars, 10);
@@ -982,8 +988,7 @@ bool parse_positive_size_t(const std::string& value, std::size_t& out) {
             return false;
         }
 
-        if (parsed == 0 ||
-            parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
+        if (parsed == 0 || parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
             return false;
         }
 
@@ -1001,7 +1006,8 @@ bool parse_positive_size_t(const std::string& value, std::size_t& out) {
  * @param out Parsed distribution value on success.
  * @return bool True if parsing succeeded and value is finite/in-range.
  */
-bool parse_distribution_modifier(const std::string& value, double& out) {
+bool parse_distribution_modifier(const std::string& value, double& out)
+{
     try {
         std::size_t parsedChars = 0;
         const double parsed = std::stod(value, &parsedChars);
@@ -1028,10 +1034,10 @@ bool parse_distribution_modifier(const std::string& value, double& out) {
  * @param argv Argument vector.
  * @return int Exit status code (0 on success, non-zero on argument errors).
  */
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     std::size_t pointCount = 1000;
-    const std::size_t hwThreadCount =
-        std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    const std::size_t hwThreadCount = std::max<std::size_t>(1, std::thread::hardware_concurrency());
     std::size_t threadCount = hwThreadCount;
     double distributionModifier = 10.0;
     bool runBruteForceCheck = true;
@@ -1181,8 +1187,7 @@ int main(int argc, char* argv[]) {
     const std::chrono::duration<double, std::milli> customSerialMs = t2 - t1;
 
     const auto t3 = std::chrono::high_resolution_clock::now();
-    ClosestPairResult customParallelResult =
-        chunked_parallel_cross_rank_search(points, threadCount);
+    ClosestPairResult customParallelResult = chunked_parallel_cross_rank_search(points, threadCount);
     const auto t4 = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double, std::milli> customParallelMs = t4 - t3;
 
@@ -1200,8 +1205,7 @@ int main(int argc, char* argv[]) {
         divideConquerSerialMs = td2 - td1;
 
         const auto td3 = std::chrono::high_resolution_clock::now();
-        divideConquerParallelResult =
-            divide_and_conquer_parallel_closest_pair(points, threadCount);
+        divideConquerParallelResult = divide_and_conquer_parallel_closest_pair(points, threadCount);
         const auto td4 = std::chrono::high_resolution_clock::now();
         divideConquerParallelMs = td4 - td3;
     }
@@ -1226,8 +1230,7 @@ int main(int argc, char* argv[]) {
     print_result("CRNS (Serial):", customSerialResult);
     print_result(
         "CRNS (Parallel Shared-Bound):",
-        customParallelResult
-    );
+        customParallelResult);
 
     if (runDivideConquer) {
         print_result("Divide and Conquer (Serial):", divideConquerSerialResult);
@@ -1252,16 +1255,10 @@ int main(int argc, char* argv[]) {
                 std::max(customSerialResult.bestDistSq, customParallelResult.bestDistSq),
                 runDivideConquer
                     ? std::max(divideConquerParallelResult.bestDistSq, bruteForceResult.bestDistSq)
-                    : bruteForceResult.bestDistSq
-            )
-        );
+                    : bruteForceResult.bestDistSq));
 
-        const bool customSerialMatch =
-            std::abs(customSerialResult.bestDistSq - bruteForceResult.bestDistSq) <=
-            (1e-12 * scale);
-        const bool customParallelMatch =
-            std::abs(customParallelResult.bestDistSq - bruteForceResult.bestDistSq) <=
-            (1e-12 * scale);
+        const bool customSerialMatch = std::abs(customSerialResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
+        const bool customParallelMatch = std::abs(customParallelResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
 
         std::cout << "CRNS serial matches brute force: "
                   << (customSerialMatch ? "true" : "false") << "\n";
@@ -1269,12 +1266,8 @@ int main(int argc, char* argv[]) {
                   << (customParallelMatch ? "true" : "false") << "\n";
 
         if (runDivideConquer) {
-            const bool divideConquerSerialMatch =
-                std::abs(divideConquerSerialResult.bestDistSq - bruteForceResult.bestDistSq) <=
-                (1e-12 * scale);
-            const bool divideConquerParallelMatch =
-                std::abs(divideConquerParallelResult.bestDistSq - bruteForceResult.bestDistSq) <=
-                (1e-12 * scale);
+            const bool divideConquerSerialMatch = std::abs(divideConquerSerialResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
+            const bool divideConquerParallelMatch = std::abs(divideConquerParallelResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
 
             std::cout << "Divide-and-conquer serial matches brute force: "
                       << (divideConquerSerialMatch ? "true" : "false") << "\n";
@@ -1283,23 +1276,20 @@ int main(int argc, char* argv[]) {
         }
 
         if (runHybrid) {
-            const bool hybridMatch =
-                std::abs(hybridResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
+            const bool hybridMatch = std::abs(hybridResult.bestDistSq - bruteForceResult.bestDistSq) <= (1e-12 * scale);
             std::cout << "Hybrid matches brute force: " << (hybridMatch ? "true" : "false")
                       << "\n";
         }
 
         if (customSerialResult.comparisons > 0) {
             std::cout << "Comparison reduction factor (brute / CRNS serial): "
-                      << static_cast<double>(bruteForceResult.comparisons) /
-                             static_cast<double>(customSerialResult.comparisons)
+                      << static_cast<double>(bruteForceResult.comparisons) / static_cast<double>(customSerialResult.comparisons)
                       << "\n";
         }
 
         if (customParallelResult.comparisons > 0) {
             std::cout << "Comparison reduction factor (brute / CRNS parallel): "
-                      << static_cast<double>(bruteForceResult.comparisons) /
-                             static_cast<double>(customParallelResult.comparisons)
+                      << static_cast<double>(bruteForceResult.comparisons) / static_cast<double>(customParallelResult.comparisons)
                       << "\n";
         }
     } else {
@@ -1312,18 +1302,12 @@ int main(int argc, char* argv[]) {
                     std::max(customSerialResult.bestDistSq, customParallelResult.bestDistSq),
                     std::max(
                         divideConquerSerialResult.bestDistSq,
-                        divideConquerParallelResult.bestDistSq
-                    )
-                )
-            );
+                        divideConquerParallelResult.bestDistSq)));
 
-            const bool customSerialVsDivideConquerSerial =
-                std::abs(customSerialResult.bestDistSq - divideConquerSerialResult.bestDistSq) <=
-                (1e-12 * scale);
-            const bool customParallelVsDivideConquerParallel =
-                std::abs(
-                    customParallelResult.bestDistSq - divideConquerParallelResult.bestDistSq
-                ) <= (1e-12 * scale);
+            const bool customSerialVsDivideConquerSerial = std::abs(customSerialResult.bestDistSq - divideConquerSerialResult.bestDistSq) <= (1e-12 * scale);
+            const bool customParallelVsDivideConquerParallel = std::abs(
+                                                                   customParallelResult.bestDistSq - divideConquerParallelResult.bestDistSq)
+                <= (1e-12 * scale);
 
             std::cout << "CRNS serial matches divide-and-conquer serial: "
                       << (customSerialVsDivideConquerSerial ? "true" : "false") << "\n";
@@ -1336,12 +1320,8 @@ int main(int argc, char* argv[]) {
                 1.0,
                 std::max(
                     hybridResult.bestDistSq,
-                    std::max(customSerialResult.bestDistSq, customParallelResult.bestDistSq)
-                )
-            );
-            const bool hybridVsCrnsParallel =
-                std::abs(hybridResult.bestDistSq - customParallelResult.bestDistSq) <=
-                (1e-12 * scale);
+                    std::max(customSerialResult.bestDistSq, customParallelResult.bestDistSq)));
+            const bool hybridVsCrnsParallel = std::abs(hybridResult.bestDistSq - customParallelResult.bestDistSq) <= (1e-12 * scale);
             std::cout << "Hybrid matches CRNS parallel: "
                       << (hybridVsCrnsParallel ? "true" : "false") << "\n";
         }
