@@ -27,6 +27,50 @@ struct ClosestPairResult {
     std::uint64_t comparisons = 0;
 };
 
+constexpr std::size_t kDnCBruteForceThreshold = 64;
+constexpr std::size_t kDnCParallelThreshold = 8192;
+constexpr std::size_t kHybridParallelThreshold = 8192;
+constexpr std::size_t kHybridCrnsLeafThreshold = 4096;
+
+struct AlgorithmTuning {
+    std::size_t dncBruteForceThreshold = kDnCBruteForceThreshold;
+    std::size_t dncParallelThreshold = kDnCParallelThreshold;
+    std::size_t hybridParallelThreshold = kHybridParallelThreshold;
+    std::size_t hybridCrnsLeafThreshold = kHybridCrnsLeafThreshold;
+};
+
+AlgorithmTuning make_auto_tuning(
+    std::size_t pointCount,
+    std::size_t threadCount,
+    double distributionModifier)
+{
+    AlgorithmTuning tuned;
+
+    const std::size_t safeThreads = std::max<std::size_t>(1, threadCount);
+
+    // Larger datasets and more cores usually benefit from larger leaf/granularity thresholds.
+    const std::size_t dncLeafBase = 32 + (pointCount / 250000) * 16 + safeThreads * 2;
+    tuned.dncBruteForceThreshold = std::clamp<std::size_t>(dncLeafBase, 32, 256);
+
+    const std::size_t dncParBase = pointCount / (safeThreads * 4);
+    tuned.dncParallelThreshold = std::clamp<std::size_t>(dncParBase, 4096, 65536);
+
+    const std::size_t hybridParBase = pointCount / (safeThreads * 3);
+    tuned.hybridParallelThreshold = std::clamp<std::size_t>(hybridParBase, 4096, 65536);
+
+    // For clumpier data, CRNS leaves are often effective at larger sizes.
+    const double clumpiness = 1.0 - std::clamp(distributionModifier / 10.0, 0.0, 1.0);
+    const std::size_t leafBase = static_cast<std::size_t>(1024.0 + clumpiness * 8192.0);
+    const std::size_t leafByN = pointCount / (safeThreads * 12);
+    tuned.hybridCrnsLeafThreshold = std::clamp<std::size_t>(std::max(leafBase, leafByN), 1024, 16384);
+
+    if (tuned.hybridCrnsLeafThreshold >= tuned.hybridParallelThreshold) {
+        tuned.hybridCrnsLeafThreshold = std::max<std::size_t>(1024, tuned.hybridParallelThreshold / 2);
+    }
+
+    return tuned;
+}
+
 /**
  * @brief Computes squared Euclidean distance between two points.
  *
@@ -34,7 +78,7 @@ struct ClosestPairResult {
  * @param p2 Second point.
  * @return double Squared distance between p1 and p2.
  */
-double distance_squared_between(const Point& p1, const Point& p2)
+inline double distance_squared_between(const Point& p1, const Point& p2)
 {
     const double dx = p1.x - p2.x;
     const double dy = p1.y - p2.y;
@@ -47,7 +91,7 @@ double distance_squared_between(const Point& p1, const Point& p2)
  * @param globalBestDistSq Shared best squared distance across workers.
  * @param candidateDistSq Candidate squared distance to publish.
  */
-void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateDistSq)
+inline void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateDistSq)
 {
     double observed = globalBestDistSq.load(std::memory_order_relaxed);
     while (candidateDistSq < observed && !globalBestDistSq.compare_exchange_weak(observed, candidateDistSq, std::memory_order_relaxed, std::memory_order_relaxed)) {
@@ -61,7 +105,7 @@ void publish_global_min(std::atomic<double>& globalBestDistSq, double candidateD
  * @param q Second point.
  * @param result In/out aggregate result for best distance, best pair, and comparisons.
  */
-void consider_pair(const Point& p, const Point& q, ClosestPairResult& result)
+inline void consider_pair(const Point& p, const Point& q, ClosestPairResult& result)
 {
     ++result.comparisons;
     const double dSq = distance_squared_between(p, q);
@@ -147,9 +191,17 @@ ClosestPairResult brute_force_closest_pair(const std::vector<Point>& points)
         return result;
     }
 
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        for (std::size_t j = i + 1; j < points.size(); ++j) {
-            consider_pair(points[i], points[j], result);
+    const std::size_t n = points.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const Point& p = points[i];
+        for (std::size_t j = i + 1; j < n; ++j) {
+            ++result.comparisons;
+            const double dSq = distance_squared_between(p, points[j]);
+            if (dSq < result.bestDistSq) {
+                result.bestDistSq = dSq;
+                result.a = p;
+                result.b = points[j];
+            }
         }
     }
 
@@ -165,7 +217,7 @@ ClosestPairResult brute_force_closest_pair(const std::vector<Point>& points)
  */
 ClosestPairResult bootstrap_initial_bound(
     const std::vector<Point>& px,
-    const std::vector<Point>& py)
+    const std::vector<const Point*>& py)
 {
     ClosestPairResult result;
 
@@ -178,7 +230,7 @@ ClosestPairResult bootstrap_initial_bound(
     }
 
     for (std::size_t i = 0; i + 1 < py.size(); ++i) {
-        consider_pair(py[i], py[i + 1], result);
+        consider_pair(*py[i], *py[i + 1], result);
     }
 
     return result;
@@ -196,17 +248,17 @@ ClosestPairResult bootstrap_initial_bound(
 ClosestPairResult merge_divide_and_conquer_results(
     const ClosestPairResult& leftResult,
     const ClosestPairResult& rightResult,
-    const std::vector<Point>& py,
+    const std::vector<const Point*>& py,
     double splitX)
 {
     ClosestPairResult merged = (leftResult.bestDistSq <= rightResult.bestDistSq) ? leftResult : rightResult;
     merged.comparisons = leftResult.comparisons + rightResult.comparisons;
 
-    std::vector<Point> strip;
+    std::vector<const Point*> strip;
     strip.reserve(py.size());
 
-    for (const Point& p : py) {
-        const double dx = p.x - splitX;
+    for (const Point* p : py) {
+        const double dx = p->x - splitX;
         if ((dx * dx) < merged.bestDistSq) {
             strip.push_back(p);
         }
@@ -215,12 +267,12 @@ ClosestPairResult merge_divide_and_conquer_results(
     for (std::size_t i = 0; i < strip.size(); ++i) {
         const std::size_t upper = std::min<std::size_t>(strip.size(), i + 8);
         for (std::size_t j = i + 1; j < upper; ++j) {
-            const double dy = strip[j].y - strip[i].y;
+            const double dy = strip[j]->y - strip[i]->y;
             if ((dy * dy) >= merged.bestDistSq) {
                 break;
             }
 
-            consider_pair(strip[i], strip[j], merged);
+            consider_pair(*strip[i], *strip[j], merged);
         }
     }
 
@@ -247,8 +299,15 @@ ClosestPairResult brute_force_closest_pair_range(
     }
 
     for (std::size_t i = beginIndex; i < endIndex; ++i) {
+        const Point& p = px[i];
         for (std::size_t j = i + 1; j < endIndex; ++j) {
-            consider_pair(px[i], px[j], result);
+            ++result.comparisons;
+            const double dSq = distance_squared_between(p, px[j]);
+            if (dSq < result.bestDistSq) {
+                result.bestDistSq = dSq;
+                result.a = p;
+                result.b = px[j];
+            }
         }
     }
 
@@ -265,19 +324,19 @@ ClosestPairResult brute_force_closest_pair_range(
  * @param rightPy Output Y-sorted points belonging to right half.
  */
 void split_py_with_rank_cut(
-    const std::vector<Point>& py,
+    const std::vector<const Point*>& py,
     const std::vector<std::size_t>& idToRank,
     std::size_t splitRank,
-    std::vector<Point>& leftPy,
-    std::vector<Point>& rightPy)
+    std::vector<const Point*>& leftPy,
+    std::vector<const Point*>& rightPy)
 {
     leftPy.clear();
     rightPy.clear();
     leftPy.reserve(py.size() / 2 + 1);
     rightPy.reserve(py.size() / 2 + 1);
 
-    for (const Point& p : py) {
-        if (idToRank[p.id] < splitRank) {
+    for (const Point* p : py) {
+        if (idToRank[p->id] < splitRank) {
             leftPy.push_back(p);
         } else {
             rightPy.push_back(p);
@@ -299,22 +358,23 @@ ClosestPairResult divide_and_conquer_serial_rec(
     const std::vector<Point>& px,
     std::size_t beginIndex,
     std::size_t endIndex,
-    const std::vector<Point>& py,
-    const std::vector<std::size_t>& idToRank)
+    const std::vector<const Point*>& py,
+    const std::vector<std::size_t>& idToRank,
+    std::size_t bruteForceThreshold)
 {
-    if (endIndex - beginIndex <= 3) {
+    if (endIndex - beginIndex <= bruteForceThreshold) {
         return brute_force_closest_pair_range(px, beginIndex, endIndex);
     }
 
     const std::size_t mid = beginIndex + (endIndex - beginIndex) / 2;
     const double splitX = px[mid].x;
 
-    std::vector<Point> leftPy;
-    std::vector<Point> rightPy;
+    std::vector<const Point*> leftPy;
+    std::vector<const Point*> rightPy;
     split_py_with_rank_cut(py, idToRank, mid, leftPy, rightPy);
 
-    const ClosestPairResult leftResult = divide_and_conquer_serial_rec(px, beginIndex, mid, leftPy, idToRank);
-    const ClosestPairResult rightResult = divide_and_conquer_serial_rec(px, mid, endIndex, rightPy, idToRank);
+    const ClosestPairResult leftResult = divide_and_conquer_serial_rec(px, beginIndex, mid, leftPy, idToRank, bruteForceThreshold);
+    const ClosestPairResult rightResult = divide_and_conquer_serial_rec(px, mid, endIndex, rightPy, idToRank, bruteForceThreshold);
 
     return merge_divide_and_conquer_results(leftResult, rightResult, py, splitX);
 }
@@ -335,20 +395,21 @@ ClosestPairResult divide_and_conquer_parallel_rec(
     const std::vector<Point>& px,
     std::size_t beginIndex,
     std::size_t endIndex,
-    const std::vector<Point>& py,
+    const std::vector<const Point*>& py,
     const std::vector<std::size_t>& idToRank,
     std::size_t threadBudget,
-    std::size_t parallelThreshold)
+    std::size_t parallelThreshold,
+    std::size_t bruteForceThreshold)
 {
-    if (endIndex - beginIndex <= 3) {
+    if (endIndex - beginIndex <= bruteForceThreshold) {
         return brute_force_closest_pair_range(px, beginIndex, endIndex);
     }
 
     const std::size_t mid = beginIndex + (endIndex - beginIndex) / 2;
     const double splitX = px[mid].x;
 
-    std::vector<Point> leftPy;
-    std::vector<Point> rightPy;
+    std::vector<const Point*> leftPy;
+    std::vector<const Point*> rightPy;
     split_py_with_rank_cut(py, idToRank, mid, leftPy, rightPy);
 
     ClosestPairResult leftResult;
@@ -361,7 +422,7 @@ ClosestPairResult divide_and_conquer_parallel_rec(
 
         auto leftFuture = std::async(
             std::launch::async,
-            [&px, &idToRank, beginIndex, mid, leftBudget, parallelThreshold, leftPy = std::move(leftPy)]() {
+            [&px, &idToRank, beginIndex, mid, leftBudget, parallelThreshold, bruteForceThreshold, leftPy = std::move(leftPy)]() {
                 return divide_and_conquer_parallel_rec(
                     px,
                     beginIndex,
@@ -369,7 +430,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
                     leftPy,
                     idToRank,
                     leftBudget,
-                    parallelThreshold);
+                    parallelThreshold,
+                    bruteForceThreshold);
             });
 
         rightResult = divide_and_conquer_parallel_rec(
@@ -379,7 +441,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             rightPy,
             idToRank,
             rightBudget,
-            parallelThreshold);
+            parallelThreshold,
+            bruteForceThreshold);
         leftResult = leftFuture.get();
     } else {
         leftResult = divide_and_conquer_parallel_rec(
@@ -389,7 +452,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             leftPy,
             idToRank,
             1,
-            parallelThreshold);
+            parallelThreshold,
+            bruteForceThreshold);
         rightResult = divide_and_conquer_parallel_rec(
             px,
             mid,
@@ -397,7 +461,8 @@ ClosestPairResult divide_and_conquer_parallel_rec(
             rightPy,
             idToRank,
             1,
-            parallelThreshold);
+            parallelThreshold,
+            bruteForceThreshold);
     }
 
     return merge_divide_and_conquer_results(leftResult, rightResult, py, splitX);
@@ -409,7 +474,9 @@ ClosestPairResult divide_and_conquer_parallel_rec(
  * @param points Input points.
  * @return ClosestPairResult Closest-pair result computed by serial D&C.
  */
-ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point>& points)
+ClosestPairResult divide_and_conquer_serial_closest_pair(
+    const std::vector<Point>& points,
+    std::size_t bruteForceThreshold = kDnCBruteForceThreshold)
 {
     ClosestPairResult result;
 
@@ -418,7 +485,6 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
     }
 
     std::vector<Point> px = points;
-    std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x)
@@ -428,12 +494,18 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
         return a.id < b.id;
     });
 
-    std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y)
-            return a.y < b.y;
-        if (a.x != b.x)
-            return a.x < b.x;
-        return a.id < b.id;
+    std::vector<const Point*> py;
+    py.reserve(px.size());
+    for (const Point& p : px) {
+        py.push_back(&p);
+    }
+
+    std::sort(py.begin(), py.end(), [](const Point* a, const Point* b) {
+        if (a->y != b->y)
+            return a->y < b->y;
+        if (a->x != b->x)
+            return a->x < b->x;
+        return a->id < b->id;
     });
 
     std::vector<std::size_t> idToRank(points.size(), 0);
@@ -441,7 +513,7 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
         idToRank[px[i].id] = i;
     }
 
-    return divide_and_conquer_serial_rec(px, 0, px.size(), py, idToRank);
+    return divide_and_conquer_serial_rec(px, 0, px.size(), py, idToRank, bruteForceThreshold);
 }
 
 /**
@@ -453,7 +525,9 @@ ClosestPairResult divide_and_conquer_serial_closest_pair(const std::vector<Point
  */
 ClosestPairResult divide_and_conquer_parallel_closest_pair(
     const std::vector<Point>& points,
-    std::size_t threadCount)
+    std::size_t threadCount,
+    std::size_t parallelThreshold = kDnCParallelThreshold,
+    std::size_t bruteForceThreshold = kDnCBruteForceThreshold)
 {
     ClosestPairResult result;
 
@@ -466,7 +540,6 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
     }
 
     std::vector<Point> px = points;
-    std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x)
@@ -476,12 +549,18 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
         return a.id < b.id;
     });
 
-    std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y)
-            return a.y < b.y;
-        if (a.x != b.x)
-            return a.x < b.x;
-        return a.id < b.id;
+    std::vector<const Point*> py;
+    py.reserve(px.size());
+    for (const Point& p : px) {
+        py.push_back(&p);
+    }
+
+    std::sort(py.begin(), py.end(), [](const Point* a, const Point* b) {
+        if (a->y != b->y)
+            return a->y < b->y;
+        if (a->x != b->x)
+            return a->x < b->x;
+        return a->id < b->id;
     });
 
     std::vector<std::size_t> idToRank(points.size(), 0);
@@ -489,7 +568,6 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
         idToRank[px[i].id] = i;
     }
 
-    const std::size_t parallelThreshold = 2048;
     return divide_and_conquer_parallel_rec(
         px,
         0,
@@ -497,7 +575,8 @@ ClosestPairResult divide_and_conquer_parallel_closest_pair(
         py,
         idToRank,
         threadCount,
-        parallelThreshold);
+        parallelThreshold,
+        bruteForceThreshold);
 }
 
 /**
@@ -513,7 +592,7 @@ ClosestPairResult crns_serial_search_from_sorted_views(
     const std::vector<Point>& px,
     std::size_t beginIndex,
     std::size_t endIndex,
-    const std::vector<Point>& py)
+    const std::vector<const Point*>& py)
 {
     ClosestPairResult result;
 
@@ -526,23 +605,39 @@ ClosestPairResult crns_serial_search_from_sorted_views(
     }
 
     for (std::size_t i = 0; i + 1 < py.size(); ++i) {
-        consider_pair(py[i], py[i + 1], result);
+        consider_pair(*py[i], *py[i + 1], result);
     }
 
     for (std::size_t i = beginIndex; i < endIndex; ++i) {
         const Point& p = px[i];
+        double bestSq = result.bestDistSq;
+        if (bestSq == 0.0) {
+            break;
+        }
 
         std::size_t j = i + 1;
         while (j < endIndex) {
-            const double dx = px[j].x - p.x;
-            if ((dx * dx) >= result.bestDistSq) {
+            const Point& q = px[j];
+            const double dx = q.x - p.x;
+            const double dxSq = dx * dx;
+            if (dxSq >= bestSq) {
                 break;
             }
 
-            const Point& q = px[j];
             const double dy = q.y - p.y;
-            if ((dy * dy) < result.bestDistSq) {
-                consider_pair(p, q, result);
+            const double dySq = dy * dy;
+            if (dySq < bestSq) {
+                ++result.comparisons;
+                const double dSq = dxSq + dySq;
+                if (dSq < bestSq) {
+                    bestSq = dSq;
+                    result.bestDistSq = dSq;
+                    result.a = p;
+                    result.b = q;
+                    if (bestSq == 0.0) {
+                        break;
+                    }
+                }
             }
 
             ++j;
@@ -569,7 +664,7 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
     const std::vector<Point>& px,
     std::size_t beginIndex,
     std::size_t endIndex,
-    const std::vector<Point>& py,
+    const std::vector<const Point*>& py,
     const std::vector<std::size_t>& idToRank,
     std::size_t threadBudget,
     std::size_t parallelThreshold,
@@ -588,8 +683,8 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
     const std::size_t mid = beginIndex + problemSize / 2;
     const double splitX = px[mid].x;
 
-    std::vector<Point> leftPy;
-    std::vector<Point> rightPy;
+    std::vector<const Point*> leftPy;
+    std::vector<const Point*> rightPy;
     split_py_with_rank_cut(py, idToRank, mid, leftPy, rightPy);
 
     ClosestPairResult leftResult;
@@ -657,7 +752,9 @@ ClosestPairResult hybrid_parallel_dnc_crns_rec(
  */
 ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
     const std::vector<Point>& points,
-    std::size_t threadCount)
+    std::size_t threadCount,
+    std::size_t parallelThreshold = kHybridParallelThreshold,
+    std::size_t crnsLeafThreshold = kHybridCrnsLeafThreshold)
 {
     ClosestPairResult result;
 
@@ -670,7 +767,6 @@ ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
     }
 
     std::vector<Point> px = points;
-    std::vector<Point> py = points;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x)
@@ -680,12 +776,18 @@ ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
         return a.id < b.id;
     });
 
-    std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y)
-            return a.y < b.y;
-        if (a.x != b.x)
-            return a.x < b.x;
-        return a.id < b.id;
+    std::vector<const Point*> py;
+    py.reserve(px.size());
+    for (const Point& p : px) {
+        py.push_back(&p);
+    }
+
+    std::sort(py.begin(), py.end(), [](const Point* a, const Point* b) {
+        if (a->y != b->y)
+            return a->y < b->y;
+        if (a->x != b->x)
+            return a->x < b->x;
+        return a->id < b->id;
     });
 
     std::vector<std::size_t> idToRank(points.size(), 0);
@@ -693,8 +795,6 @@ ClosestPairResult hybrid_parallel_dnc_crns_closest_pair(
         idToRank[px[i].id] = i;
     }
 
-    const std::size_t parallelThreshold = 4096;
-    const std::size_t crnsLeafThreshold = 2048;
     return hybrid_parallel_dnc_crns_rec(
         px,
         0,
@@ -721,7 +821,7 @@ ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points)
     }
 
     std::vector<Point> px = points;
-    std::vector<Point> py = points;
+    std::vector<const Point*> py;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x)
@@ -731,30 +831,54 @@ ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points)
         return a.id < b.id;
     });
 
-    std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y)
-            return a.y < b.y;
-        if (a.x != b.x)
-            return a.x < b.x;
-        return a.id < b.id;
+    py.reserve(px.size());
+    for (const Point& p : px) {
+        py.push_back(&p);
+    }
+
+    std::sort(py.begin(), py.end(), [](const Point* a, const Point* b) {
+        if (a->y != b->y)
+            return a->y < b->y;
+        if (a->x != b->x)
+            return a->x < b->x;
+        return a->id < b->id;
     });
 
     finalResult = bootstrap_initial_bound(px, py);
+    if (finalResult.bestDistSq == 0.0) {
+        return finalResult;
+    }
 
     for (std::size_t i = 0; i < px.size(); ++i) {
         const Point& p = px[i];
+        double bestSq = finalResult.bestDistSq;
+        if (bestSq == 0.0) {
+            break;
+        }
 
         std::size_t j = i + 1;
         while (j < px.size()) {
-            const double dx = px[j].x - p.x;
-            if ((dx * dx) >= finalResult.bestDistSq) {
+            const Point& q = px[j];
+            const double dx = q.x - p.x;
+            const double dxSq = dx * dx;
+            if (dxSq >= bestSq) {
                 break;
             }
 
-            const Point& q = px[j];
             const double dy = q.y - p.y;
-            if ((dy * dy) < finalResult.bestDistSq) {
-                consider_pair(p, q, finalResult);
+            const double dySq = dy * dy;
+            if (dySq < bestSq) {
+                ++finalResult.comparisons;
+                const double dSq = dxSq + dySq;
+                if (dSq < bestSq) {
+                    bestSq = dSq;
+                    finalResult.bestDistSq = dSq;
+                    finalResult.a = p;
+                    finalResult.b = q;
+                    if (bestSq == 0.0) {
+                        break;
+                    }
+                }
             }
 
             ++j;
@@ -765,19 +889,23 @@ ClosestPairResult cross_rank_serial_search(const std::vector<Point>& points)
 }
 
 /**
- * @brief Worker for one chunk of the CRNS X-forward outer loop.
+ * @brief Worker for dynamic-block CRNS X-forward processing.
  *
  * @param px Points sorted by X.
- * @param beginIndex Inclusive begin index for this worker's chunk.
+ * @param nextIndex Shared next-start index for dynamic block assignment.
  * @param endIndex Exclusive end index for this worker's chunk.
+ * @param blockSize Number of outer-loop i-indices to claim per fetch.
  * @param initialBoundSq Initial shared bound used to seed local state.
  * @param globalBestDistSq Shared atomic global best squared distance.
  * @param outResult Output per-worker result.
  */
-void parallel_worker_x_forward(
+void parallel_worker_x_forward_dynamic(
     const std::vector<Point>& px,
-    std::size_t beginIndex,
+    std::atomic<std::size_t>& nextIndex,
     std::size_t endIndex,
+    std::size_t blockSize,
+    std::size_t refreshOuterEvery,
+    std::size_t refreshComparisonEvery,
     double initialBoundSq,
     std::atomic<double>& globalBestDistSq,
     ClosestPairResult& outResult)
@@ -785,45 +913,79 @@ void parallel_worker_x_forward(
     ClosestPairResult local;
     local.bestDistSq = initialBoundSq;
 
-    if (px.size() < 2 || beginIndex >= endIndex) {
+    if (px.size() < 2) {
         outResult = local;
         return;
     }
 
-    for (std::size_t i = beginIndex; i < endIndex; ++i) {
-        const double sharedBoundSq = globalBestDistSq.load(std::memory_order_relaxed);
-        if (sharedBoundSq < local.bestDistSq) {
-            local.bestDistSq = sharedBoundSq;
+    while (true) {
+        if (globalBestDistSq.load(std::memory_order_relaxed) == 0.0) {
+            break;
         }
 
-        const Point& p = px[i];
+        const std::size_t beginIndex = nextIndex.fetch_add(blockSize, std::memory_order_relaxed);
+        if (beginIndex >= endIndex) {
+            break;
+        }
+        const std::size_t blockEnd = std::min(beginIndex + blockSize, endIndex);
 
-        std::size_t j = i + 1;
-        while (j < px.size()) {
-            const double dx = px[j].x - p.x;
-            if ((dx * dx) >= local.bestDistSq) {
+        std::size_t outerCounter = refreshOuterEvery;
+        for (std::size_t i = beginIndex; i < blockEnd; ++i) {
+            if (--outerCounter == 0) {
+                const double sharedBoundSq = globalBestDistSq.load(std::memory_order_relaxed);
+                if (sharedBoundSq < local.bestDistSq) {
+                    local.bestDistSq = sharedBoundSq;
+                }
+                outerCounter = refreshOuterEvery;
+            }
+
+            const Point& p = px[i];
+            double bestSq = local.bestDistSq;
+            if (bestSq == 0.0) {
                 break;
             }
 
-            const Point& q = px[j];
-            const double dy = q.y - p.y;
-
-            if ((dy * dy) < local.bestDistSq) {
-                ++local.comparisons;
-                const double dSq = distance_squared_between(p, q);
-                if (dSq < local.bestDistSq) {
-                    local.bestDistSq = dSq;
-                    local.a = p;
-                    local.b = q;
-                    publish_global_min(globalBestDistSq, dSq);
+            std::size_t j = i + 1;
+            std::size_t comparisonCounter = refreshComparisonEvery;
+            while (j < px.size()) {
+                const Point& q = px[j];
+                const double dx = q.x - p.x;
+                const double dxSq = dx * dx;
+                if (dxSq >= bestSq) {
+                    break;
                 }
-            }
 
-            ++j;
+                const double dy = q.y - p.y;
+                const double dySq = dy * dy;
 
-            const double refreshedBoundSq = globalBestDistSq.load(std::memory_order_relaxed);
-            if (refreshedBoundSq < local.bestDistSq) {
-                local.bestDistSq = refreshedBoundSq;
+                if (dySq < bestSq) {
+                    ++local.comparisons;
+                    const double dSq = dxSq + dySq;
+                    if (dSq < bestSq) {
+                        bestSq = dSq;
+                        local.bestDistSq = dSq;
+                        local.a = p;
+                        local.b = q;
+                        publish_global_min(globalBestDistSq, dSq);
+                        if (bestSq == 0.0) {
+                            break;
+                        }
+                    }
+
+                    if (--comparisonCounter == 0) {
+                        const double refreshedBoundSq = globalBestDistSq.load(std::memory_order_relaxed);
+                        if (refreshedBoundSq < bestSq) {
+                            bestSq = refreshedBoundSq;
+                            local.bestDistSq = bestSq;
+                            if (bestSq == 0.0) {
+                                break;
+                            }
+                        }
+                        comparisonCounter = refreshComparisonEvery;
+                    }
+                }
+
+                ++j;
             }
         }
     }
@@ -840,7 +1002,10 @@ void parallel_worker_x_forward(
  */
 ClosestPairResult chunked_parallel_cross_rank_search(
     const std::vector<Point>& points,
-    std::size_t threadCount)
+    std::size_t threadCount,
+    std::size_t blockSizeOverride = 0,
+    std::size_t refreshOuterEvery = 16,
+    std::size_t refreshComparisonEvery = 32)
 {
     ClosestPairResult finalResult;
 
@@ -853,7 +1018,7 @@ ClosestPairResult chunked_parallel_cross_rank_search(
     }
 
     std::vector<Point> px = points;
-    std::vector<Point> py = points;
+    std::vector<const Point*> py;
 
     std::sort(px.begin(), px.end(), [](const Point& a, const Point& b) {
         if (a.x != b.x)
@@ -863,16 +1028,24 @@ ClosestPairResult chunked_parallel_cross_rank_search(
         return a.id < b.id;
     });
 
-    std::sort(py.begin(), py.end(), [](const Point& a, const Point& b) {
-        if (a.y != b.y)
-            return a.y < b.y;
-        if (a.x != b.x)
-            return a.x < b.x;
-        return a.id < b.id;
+    py.reserve(px.size());
+    for (const Point& p : px) {
+        py.push_back(&p);
+    }
+
+    std::sort(py.begin(), py.end(), [](const Point* a, const Point* b) {
+        if (a->y != b->y)
+            return a->y < b->y;
+        if (a->x != b->x)
+            return a->x < b->x;
+        return a->id < b->id;
     });
 
     // Bootstrapping phase from adjacent pairs in both sorted orders.
     ClosestPairResult bootstrap = bootstrap_initial_bound(px, py);
+    if (bootstrap.bestDistSq == 0.0) {
+        return bootstrap;
+    }
     std::atomic<double> globalBestDistSq(bootstrap.bestDistSq);
 
     // Partition the outer loop across threads.
@@ -886,24 +1059,23 @@ ClosestPairResult chunked_parallel_cross_rank_search(
 
     threads.reserve(threadCount);
 
-    const std::size_t baseChunk = n / threadCount;
-    const std::size_t remainder = n % threadCount;
+    std::atomic<std::size_t> nextIndex(0);
+    const std::size_t blockSize = blockSizeOverride == 0
+        ? std::max<std::size_t>(64, n / (threadCount * 8))
+        : blockSizeOverride;
 
-    std::size_t start = 0;
     for (std::size_t t = 0; t < threadCount; ++t) {
-        const std::size_t chunkSize = baseChunk + (t < remainder ? 1 : 0);
-        const std::size_t end = start + chunkSize;
-
         threads.emplace_back(
-            parallel_worker_x_forward,
+            parallel_worker_x_forward_dynamic,
             std::cref(px),
-            start,
-            end,
+            std::ref(nextIndex),
+            n,
+            blockSize,
+            std::max<std::size_t>(1, refreshOuterEvery),
+            std::max<std::size_t>(1, refreshComparisonEvery),
             bootstrap.bestDistSq,
             std::ref(globalBestDistSq),
             std::ref(localResults[t]));
-
-        start = end;
     }
 
     for (auto& th : threads) {
@@ -960,7 +1132,11 @@ void print_usage(const char* programName, std::size_t maxThreads)
               << " [--distribution D | --distribution=D | -d D]"
               << " [--no-bruteforce]"
               << " [--run-divide-conquer]"
-              << " [--run-hybrid]\n";
+              << " [--run-hybrid]"
+              << " [--auto-tune]"
+              << " [--crns-block-size N]"
+              << " [--crns-refresh-outer N]"
+              << " [--crns-refresh-comparisons N]\n";
     std::cout << "  --points, -p   Number of random points to generate (positive integer)\n";
     std::cout << "  --threads, -t  Number of worker threads (positive integer, max "
               << maxThreads << ")\n";
@@ -969,6 +1145,10 @@ void print_usage(const char* programName, std::size_t maxThreads)
     std::cout << "  --no-bruteforce  Skip brute-force validation and timing\n";
     std::cout << "  --run-divide-conquer  Run serial and parallel divide-and-conquer variants\n";
     std::cout << "  --run-hybrid  Run hybrid parallel algorithm (D&C outer + CRNS leaves)\n";
+    std::cout << "  --auto-tune  Enable adaptive threshold tuning for D&C and hybrid\n";
+    std::cout << "  --crns-block-size  CRNS parallel block size for dynamic scheduling (0=auto)\n";
+    std::cout << "  --crns-refresh-outer  CRNS outer-loop refresh cadence for shared bound\n";
+    std::cout << "  --crns-refresh-comparisons  CRNS comparison refresh cadence for shared bound\n";
 }
 
 /**
@@ -989,6 +1169,34 @@ bool parse_positive_size_t(const std::string& value, std::size_t& out)
         }
 
         if (parsed == 0 || parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
+            return false;
+        }
+
+        out = static_cast<std::size_t>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+/**
+ * @brief Parses a non-negative integer into std::size_t.
+ *
+ * @param value Input string.
+ * @param out Parsed value on success.
+ * @return bool True if parsing succeeded and value is in range.
+ */
+bool parse_non_negative_size_t(const std::string& value, std::size_t& out)
+{
+    try {
+        std::size_t parsedChars = 0;
+        const unsigned long long parsed = std::stoull(value, &parsedChars, 10);
+
+        if (parsedChars != value.size()) {
+            return false;
+        }
+
+        if (parsed > static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max())) {
             return false;
         }
 
@@ -1043,6 +1251,10 @@ int main(int argc, char* argv[])
     bool runBruteForceCheck = true;
     bool runDivideConquer = false;
     bool runHybrid = false;
+    bool autoTune = false;
+    std::size_t crnsBlockSize = 0;
+    std::size_t crnsRefreshOuterEvery = 16;
+    std::size_t crnsRefreshComparisonEvery = 32;
     const unsigned int seed = 12345;
 
     for (int i = 1; i < argc; ++i) {
@@ -1174,12 +1386,105 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        if (arg == "--auto-tune") {
+            autoTune = true;
+            continue;
+        }
+
+        if (arg == "--crns-block-size") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << arg << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            const std::string value = argv[++i];
+            if (!parse_non_negative_size_t(value, crnsBlockSize)) {
+                std::cerr << "Invalid CRNS block size: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (arg.rfind("--crns-block-size=", 0) == 0) {
+            const std::string value = arg.substr(std::string("--crns-block-size=").size());
+            if (!parse_non_negative_size_t(value, crnsBlockSize)) {
+                std::cerr << "Invalid CRNS block size: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (arg == "--crns-refresh-outer") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << arg << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            const std::string value = argv[++i];
+            if (!parse_positive_size_t(value, crnsRefreshOuterEvery)) {
+                std::cerr << "Invalid CRNS outer refresh cadence: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (arg.rfind("--crns-refresh-outer=", 0) == 0) {
+            const std::string value = arg.substr(std::string("--crns-refresh-outer=").size());
+            if (!parse_positive_size_t(value, crnsRefreshOuterEvery)) {
+                std::cerr << "Invalid CRNS outer refresh cadence: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (arg == "--crns-refresh-comparisons") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << arg << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            const std::string value = argv[++i];
+            if (!parse_positive_size_t(value, crnsRefreshComparisonEvery)) {
+                std::cerr << "Invalid CRNS comparison refresh cadence: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
+        if (arg.rfind("--crns-refresh-comparisons=", 0) == 0) {
+            const std::string value = arg.substr(std::string("--crns-refresh-comparisons=").size());
+            if (!parse_positive_size_t(value, crnsRefreshComparisonEvery)) {
+                std::cerr << "Invalid CRNS comparison refresh cadence: " << value << "\n";
+                print_usage(argv[0], hwThreadCount);
+                return 1;
+            }
+
+            continue;
+        }
+
         std::cerr << "Unknown argument: " << arg << "\n";
         print_usage(argv[0], hwThreadCount);
         return 1;
     }
 
     std::vector<Point> points = generate_points(pointCount, seed, distributionModifier);
+    AlgorithmTuning tuning;
+    if (autoTune) {
+        tuning = make_auto_tuning(pointCount, threadCount, distributionModifier);
+    }
 
     const auto t1 = std::chrono::high_resolution_clock::now();
     ClosestPairResult customSerialResult = cross_rank_serial_search(points);
@@ -1187,7 +1492,12 @@ int main(int argc, char* argv[])
     const std::chrono::duration<double, std::milli> customSerialMs = t2 - t1;
 
     const auto t3 = std::chrono::high_resolution_clock::now();
-    ClosestPairResult customParallelResult = chunked_parallel_cross_rank_search(points, threadCount);
+    ClosestPairResult customParallelResult = chunked_parallel_cross_rank_search(
+        points,
+        threadCount,
+        crnsBlockSize,
+        crnsRefreshOuterEvery,
+        crnsRefreshComparisonEvery);
     const auto t4 = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double, std::milli> customParallelMs = t4 - t3;
 
@@ -1200,19 +1510,27 @@ int main(int argc, char* argv[])
 
     if (runDivideConquer) {
         const auto td1 = std::chrono::high_resolution_clock::now();
-        divideConquerSerialResult = divide_and_conquer_serial_closest_pair(points);
+        divideConquerSerialResult = divide_and_conquer_serial_closest_pair(points, kDnCBruteForceThreshold);
         const auto td2 = std::chrono::high_resolution_clock::now();
         divideConquerSerialMs = td2 - td1;
 
         const auto td3 = std::chrono::high_resolution_clock::now();
-        divideConquerParallelResult = divide_and_conquer_parallel_closest_pair(points, threadCount);
+        divideConquerParallelResult = divide_and_conquer_parallel_closest_pair(
+            points,
+            threadCount,
+            tuning.dncParallelThreshold,
+            tuning.dncBruteForceThreshold);
         const auto td4 = std::chrono::high_resolution_clock::now();
         divideConquerParallelMs = td4 - td3;
     }
 
     if (runHybrid) {
         const auto th1 = std::chrono::high_resolution_clock::now();
-        hybridResult = hybrid_parallel_dnc_crns_closest_pair(points, threadCount);
+        hybridResult = hybrid_parallel_dnc_crns_closest_pair(
+            points,
+            threadCount,
+            tuning.hybridParallelThreshold,
+            tuning.hybridCrnsLeafThreshold);
         const auto th2 = std::chrono::high_resolution_clock::now();
         hybridMs = th2 - th1;
     }
@@ -1247,6 +1565,16 @@ int main(int argc, char* argv[])
     std::cout << "Thread count: " << threadCount << "\n";
     std::cout << "Point count: " << pointCount << "\n";
     std::cout << "Distribution modifier: " << distributionModifier << "\n";
+    std::cout << "Auto tune: " << (autoTune ? "enabled" : "disabled") << "\n";
+    std::cout << "CRNS block size: " << (crnsBlockSize == 0 ? 0 : crnsBlockSize) << "\n";
+    std::cout << "CRNS refresh outer: " << crnsRefreshOuterEvery << "\n";
+    std::cout << "CRNS refresh comparisons: " << crnsRefreshComparisonEvery << "\n";
+    if (autoTune) {
+        std::cout << "D&C brute-force threshold: " << tuning.dncBruteForceThreshold << "\n";
+        std::cout << "D&C parallel threshold: " << tuning.dncParallelThreshold << "\n";
+        std::cout << "Hybrid parallel threshold: " << tuning.hybridParallelThreshold << "\n";
+        std::cout << "Hybrid CRNS leaf threshold: " << tuning.hybridCrnsLeafThreshold << "\n";
+    }
 
     if (runBruteForceCheck) {
         const double scale = std::max(
